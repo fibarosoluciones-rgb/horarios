@@ -1552,9 +1552,9 @@
 
     // Perfil/rol por email
     const PROFILE_BY_EMAIL = {
-      "admi@fibaroteleco.com": { username: "admin", displayName: "Admin", role: "admin" },
-      "m.vidal@fibaroteleco.com": { username: "maria", displayName: "María", role: "empleado", weeklyGoalHours: 40 },
-      "alicia@fibaroteleco.com": { username: "alicia", displayName: "Alicia", role: "empleado", weeklyGoalHours: 40 }
+      "admi@fibaroteleco.com": { username: "admin", displayName: "Admin", role: "admin", personaKey: "admin" },
+      "m.vidal@fibaroteleco.com": { username: "maria", displayName: "María", role: "empleado", personaKey: "maria", objetivoSemanal: 40 },
+      "alicia@fibaroteleco.com": { username: "alicia", displayName: "Alicia", role: "empleado", personaKey: "alicia", objetivoSemanal: 35 }
     };
 
     let unsubscribeGlobalState = null;
@@ -1575,9 +1575,92 @@
       if (!out.vacationCounters || typeof out.vacationCounters !== "object") out.vacationCounters = {};
       return out;
     }
+    function deepCleanForFirestore(value) {
+      // Firestore NO acepta `undefined`. Esta función elimina undefined de forma recursiva.
+      if (value === undefined) return undefined;
+      if (value === null) return null;
+
+      // Convertimos Date a ISO
+      if (value instanceof Date) return value.toISOString();
+
+      if (Array.isArray(value)) {
+        const arr = [];
+        value.forEach(v => {
+          const cleaned = deepCleanForFirestore(v);
+          if (cleaned !== undefined) arr.push(cleaned);
+        });
+        return arr;
+      }
+
+      if (typeof value === "object") {
+        const out = {};
+        Object.keys(value).forEach(k => {
+          const cleaned = deepCleanForFirestore(value[k]);
+          if (cleaned !== undefined) out[k] = cleaned;
+        });
+        return out;
+      }
+
+      if (typeof value === "function") return undefined;
+      return value;
+    }
+
+    function repairStateInPlace(state) {
+      // Asegura campos clave y evita undefined que rompería Firestore
+      if (!state || typeof state !== "object") return;
+
+      if (!Array.isArray(state.vacationRequests)) state.vacationRequests = [];
+      if (!Array.isArray(state.timeEntries)) state.timeEntries = [];
+      if (!Array.isArray(state.tasks)) state.tasks = [];
+      if (!state.vacationCounters || typeof state.vacationCounters !== "object") state.vacationCounters = {};
+
+      // Arreglar fichajes
+      state.timeEntries = state.timeEntries
+        .filter(e => e && typeof e === "object")
+        .map(e => {
+          if (!e.personaKey) {
+            if (e.username === "alicia" || e.username === "maria") e.personaKey = e.username;
+          }
+          if (e.fin === undefined) e.fin = null;
+          if (e.pausas === undefined) e.pausas = [];
+          if (e.ubicacionInicio === undefined) e.ubicacionInicio = null;
+          if (e.paused === undefined) e.paused = false;
+          if (e.lastPauseInicio === undefined) e.lastPauseInicio = null;
+          if (e.estado === undefined) e.estado = (e.fin ? "cerrada" : "abierta");
+          ensureWeekKey(e);
+          return e;
+        });
+
+      // Arreglar solicitudes de vacaciones
+      state.vacationRequests = state.vacationRequests
+        .filter(r => r && typeof r === "object")
+        .map(r => {
+          if (!r.personaKey) {
+            if (r.empleadoUsername === "alicia" || r.empleadoUsername === "maria") r.personaKey = r.empleadoUsername;
+          }
+          if (r.comentario === undefined) r.comentario = "";
+          if (r.estado === undefined) r.estado = "pendiente";
+          return r;
+        });
+
+      // Arreglar tareas
+      state.tasks = state.tasks
+        .filter(t => t && typeof t === "object")
+        .map(t => {
+          if (t.sharedWith === undefined) t.sharedWith = [];
+          if (t.description === undefined) t.description = "";
+          return t;
+        });
+
+      repairStateInPlace(appState);
+      ensureVacationCountersForEmployees();
+      ensureTasksArray();
+    }
+
 
     function refreshViewsFromState() {
       // Re-render principal (todas las secciones) cuando llega un cambio desde Firestore
+      repairStateInPlace(appState);
       ensureVacationCountersForEmployees();
       ensureTasksArray();
 
@@ -1611,12 +1694,15 @@
         try {
           if (!doc.exists) {
             // Primera vez: subimos el estado actual al cloud
-            const payload = Object.assign({}, appState, {
+            // Primera vez: subimos el estado actual al cloud
+            repairStateInPlace(appState);
+
+            const payload = deepCleanForFirestore(Object.assign({}, appState, {
               _meta: {
                 createdAt: firebase.firestore.FieldValue.serverTimestamp(),
                 createdBy: auth.currentUser ? (auth.currentUser.email || auth.currentUser.uid) : "unknown"
               }
-            });
+            }));
             await GLOBAL_STATE_REF.set(payload, { merge: true });
             hasLoadedRemote = true;
             return;
@@ -1627,6 +1713,8 @@
           // Fuente de la verdad = cloud
           isApplyingRemoteState = true;
           appState = remote;
+
+          repairStateInPlace(appState);
 
           ensureVacationCountersForEmployees();
           ensureTasksArray();
@@ -1792,12 +1880,14 @@
           if (!auth.currentUser) return;
           if (isApplyingRemoteState) return;
 
-          const payload = Object.assign({}, appState, {
+          repairStateInPlace(appState);
+
+          const payload = deepCleanForFirestore(Object.assign({}, appState, {
             _meta: {
               updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
               updatedBy: auth.currentUser.email || auth.currentUser.uid
             }
-          });
+          }));
 
           await GLOBAL_STATE_REF.set(payload, { merge: true });
         } catch (e) {
@@ -3270,6 +3360,7 @@ function actualizarUIUsuario() {
     function mostrarApp() {
       loginScreen.classList.add("hidden");
       appShell.classList.remove("hidden");
+      repairStateInPlace(appState);
       ensureVacationCountersForEmployees();
       ensureTasksArray();
       actualizarUIUsuario();
@@ -3335,11 +3426,12 @@ function actualizarUIUsuario() {
         }
 
         // Montamos el currentUser que tu app ya entiende
-        currentUser = {
+                currentUser = {
           username: profile.username,
           name: profile.displayName,
           role: profile.role,
-          weeklyGoalHours: profile.weeklyGoalHours
+          personaKey: profile.personaKey,
+          objetivoSemanal: profile.objetivoSemanal
         };
 
         saveCurrentUser();
@@ -3397,8 +3489,10 @@ tabHorario.addEventListener("click", () => setActiveTab("horario"));
     btnSolicitarVacaciones.addEventListener("click", crearSolicitudVacaciones);
 
     document.addEventListener("DOMContentLoaded", () => {
-      loadUsersFromStorage();
+      // loadUsersFromStorage();  // desactivado: ya no gestionamos usuarios por navegador
       loadState(); // Carga local como fallback (por si Firestore está vacío)
+      repairStateInPlace(appState);
+      repairStateInPlace(appState);
       ensureVacationCountersForEmployees();
       ensureTasksArray();
       mostrarLogin();
@@ -3436,11 +3530,12 @@ tabHorario.addEventListener("click", () => setActiveTab("horario"));
           return;
         }
 
-        currentUser = {
+                currentUser = {
           username: profile.username,
           name: profile.displayName,
           role: profile.role,
-          weeklyGoalHours: profile.weeklyGoalHours
+          personaKey: profile.personaKey,
+          objetivoSemanal: profile.objetivoSemanal
         };
 
         saveCurrentUser();
